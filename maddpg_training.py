@@ -1,3 +1,7 @@
+# OpenAI simple adversary using MADDPG: training
+# Dylan
+# 2024.1.7
+
 import numpy as np
 from make_env import make_env
 from maddpg_agent import MADDPG
