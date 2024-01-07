@@ -3,14 +3,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 import numpy as np
-import gym
+# import gym
 # from map_env.make_env import make_env
 from make_env import make_env
-import pyglet
+# import pyglet
 
+torch.autograd.set_detect_anomaly(True)
 
-# print(np.__version__)
-# print(torch.__version__)
+print(np.__version__)
+print(torch.__version__)
 # print(gym.__version__)
 # print(pyglet.__version__)
 #
@@ -142,7 +143,7 @@ class Actor(nn.Module):
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.to(self.device)  # TODO: not sure if self.device or device
 
-    def forward(self, state, action):
+    def forward(self, state):
         x = F.relu(self.fc1(state))
         x = F.relu(self.fc2(x))
         pi = torch.softmax(self.pi(x), dim=1)
@@ -197,7 +198,7 @@ class MADDPGAgent:
         self.target_critic.load_state_dict(critic_state_dict)
 
     def get_action(self, observation):
-        state = torch.tensor([observation], dtype=torch.float).to(self.actor.device)
+        state = torch.tensor(data=[observation], dtype=torch.float).to(self.actor.device)
         actions = self.actor.forward(state)
         noise = torch.rand(self.n_actions).to(self.actor.device)
         action = actions + noise
@@ -219,7 +220,7 @@ class MADDPGAgent:
 class MADDPG:
     def __init__(self, actor_dims, critic_dims, n_agents, n_actions,
                  scenario='simple', alpha=0.01, beta=0.01, fc1_dims=64, fc2_dims=64,
-                 gamma=0.99, tau=0.01, chkpt_dir='tmp/maddpg'):
+                 gamma=0.99, tau=0.01, chkpt_dir='tmp\\maddpg\\'):
         self.agents = []
         self.n_agents = n_agents
         self.n_actions = n_actions
@@ -233,7 +234,7 @@ class MADDPG:
     def save_checkpoint(self):
         print("Saving parameters...")
         for agent_i in self.agents:
-            agent_i.save_models()
+            agent_i.save_model()
 
     def load_checkpoint(self):
         print("Loading parameters...")
@@ -253,13 +254,13 @@ class MADDPG:
             return
 
         actor_states, states, actions, rewards, \
-            actor_new_states, states_, dones = memory.sample()
-        device = self.agent[0].actor.device
+            actor_new_states, new_states, dones = memory.sample()
+        device = self.agents[0].actor.device
 
         states = torch.tensor(states, dtype=torch.float).to(device)
         actions = torch.tensor(actions, dtype=torch.float).to(device)
         rewards = torch.tensor(rewards, dtype=torch.float).to(device)
-        states_ = torch.tensor(states_, dtype=torch.float).to(device)
+        new_states = torch.tensor(new_states, dtype=torch.float).to(device)
         dones = torch.tensor(dones).to(device)
 
         all_agents_new_actions = []
@@ -267,8 +268,8 @@ class MADDPG:
         old_agents_actions = []
 
         for agent_i, agent in enumerate(self.agents):
-            new_states = torch.tensor(actor_new_states[agent_i], dtype=torch.float).to(device)
-            new_pi = agent.target_actor.forward(new_states)
+            tmp = torch.tensor(actor_new_states[agent_i], dtype=torch.float).to(device)
+            new_pi = agent.target_actor.forward(tmp)
             all_agents_new_actions.append(new_pi)
 
             mu_states = torch.tensor(actor_states[agent_i], dtype=torch.float).to(device)
@@ -283,22 +284,24 @@ class MADDPG:
 
         for agent_i, agent in enumerate(self.agents):
             critic_target_value = agent.target_critic.forward(new_states, new_actions).flatten()
-            critic_target_value[dones[:0]] = 0.0
+            critic_target_value[dones[:,0]] = 0.0
             critic_value = agent.critic.forward(states, old_actions).flatten()
 
             target = rewards[:, agent_i] + agent.gamma * critic_target_value
             critic_loss = F.mse_loss(target, critic_value)
             agent.critic.optimizer.zero_grad()
             critic_loss.backward(retain_graph=True)
+            # critic_loss.backward()
             agent.critic.optimizer.step()
 
             actor_loss = agent.critic.forward(states, mu).flatten()
             actor_loss = -torch.mean(actor_loss)
             agent.actor.optimizer.zero_grad()
             actor_loss.backward(retain_graph=True)
+            # actor_loss.backward()
             agent.actor.optimizer.step()
 
-            agent.update_network_paramaters()
+            agent.update_net()
 
 
 def obs_list_to_state_vector(observation):
@@ -309,7 +312,7 @@ def obs_list_to_state_vector(observation):
 
 
 if __name__ == "__main__":
-    scenario = "simple"
+    scenario = "simple_adversary"
     env = make_env(scenario)
     n_agents = env.n
     actor_dims = []
@@ -317,13 +320,13 @@ if __name__ == "__main__":
         actor_dims.append(env.observation_space[agent_i].shape[0])
     critic_dims = sum(actor_dims)
 
-    n_agents = env.action_space[0].n
-    maddpg_agents = MADDPG(actor_dims, critic_dims, n_agents, n_agents,
+    n_actions = env.action_space[0].n
+    maddpg_agents = MADDPG(actor_dims, critic_dims, n_agents, n_actions,
                            scenario=scenario, alpha=0.01, beta=0.01, fc1_dims=64, fc2_dims=64,
-                           gamma=0.99, tau=0.01, chkpt_dir='tmp/maddpg')
+                           gamma=0.99, tau=0.01, chkpt_dir='D:\\Code\\maddpg_map\\map_env\\tmp\\maddpg\\')
     memory = ReplayBuffer(1000000, critic_dims, actor_dims, n_actions, n_agents, batch_size=1024)
 
-    PRINT_INTERVAL = 100
+    PRINT_INTERVAL = 500
     NUM_EPISODES = 30000
     NUM_STEPS = 25
     total_steps = 0
@@ -346,7 +349,7 @@ if __name__ == "__main__":
             next_obs, reward, done, info = env.step(actions)
 
             state = obs_list_to_state_vector(obs)
-            next_state = obs_list_to_state_vector(next_state)
+            next_state = obs_list_to_state_vector(next_obs)
 
             if episode_step > NUM_STEPS:
                 done = [True] * n_agents
