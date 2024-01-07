@@ -1,0 +1,284 @@
+# OpenAI simple adversary using MADDPG: agent
+# Dylan
+# 2024.1.7
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import os
+
+
+class ReplayBuffer:
+    def __init__(self, capacity, critic_dims, actor_dims,
+                 n_actions, n_agents, batch_size):
+        self.capacity = capacity
+        self.counter = 0
+        self.n_actions = n_actions
+        self.n_agents = n_agents
+        self.batch_size = batch_size
+        self.actor_dims = actor_dims
+        self.state_cap = np.empty((self.capacity, critic_dims))
+        self.new_state_cap = np.empty((self.capacity, critic_dims))
+        self.reward_cap = np.empty((self.capacity, self.n_agents))
+        self.done_cap = np.empty((self.capacity, self.n_agents), dtype=bool)
+
+        self.init_actor_capacity()
+
+    def init_actor_capacity(self):
+        self.actor_state_cap = []
+        self.actor_new_state_cap = []
+        self.actor_action_cap = []
+
+        for agent_i in range(self.n_agents):
+            self.actor_state_cap.append(np.empty((self.capacity, self.actor_dims[agent_i])))
+            self.actor_new_state_cap.append(np.empty((self.capacity, self.actor_dims[agent_i])))
+            self.actor_action_cap.append(np.empty((self.capacity, self.n_actions)))
+
+    def add_memo(self, raw_obs, state, action, reward, raw_next_obs, next_state, done):
+        if self.counter % self.capacity == 0 and self.counter > 0:
+            self.init_actor_capacity()
+
+        idx = self.counter % self.capacity
+
+        for agent_i in range(self.n_agents):
+            self.actor_state_cap[agent_i][idx] = raw_obs[agent_i]
+            self.actor_new_state_cap[agent_i][idx] = raw_next_obs[agent_i]
+            self.actor_action_cap[agent_i][idx] = action[agent_i]
+
+        self.state_cap[idx] = state
+        self.new_state_cap[idx] = next_state
+        self.reward_cap[idx] = reward
+        self.done_cap[idx] = done
+        self.counter += 1
+
+    def sample(self):
+        max_cap = min(self.counter, self.capacity)
+
+        batch_sequence = np.random.choice(max_cap, self.batch_size, replace=False)
+
+        states = self.state_cap[batch_sequence]
+        rewards = self.reward_cap[batch_sequence]
+        next_states = self.new_state_cap[batch_sequence]
+        dones = self.done_cap[batch_sequence]
+
+        actor_states = []
+        actor_new_states = []
+        actions = []
+
+        for agent_i in range(self.n_agents):
+            actor_states.append(self.actor_state_cap[agent_i][batch_sequence])
+            actor_new_states.append(self.actor_new_state_cap[agent_i][batch_sequence])
+            actions.append(self.actor_action_cap[agent_i][batch_sequence])
+
+        return actor_states, states, actions, rewards, actor_new_states, next_states, dones
+
+    def ready(self):
+        if self.counter >= self.batch_size:
+            return True
+        return False
+
+
+class Critic(nn.Module):
+    def __init__(self, lr_critic, input_dims, fc1_dims, fc2_dims,
+                 n_agents, n_actions, name, critic_param):
+        super(Critic, self).__init__()
+
+        self.chkpt_file = os.path.join(critic_param, name)
+        self.fc1 = nn.Linear(input_dims + n_agents * n_actions, fc1_dims)
+        self.fc2 = nn.Linear(fc1_dims, fc2_dims)
+        self.q = nn.Linear(fc2_dims, 1)
+
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=lr_critic)
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.to(self.device)  # TODO: not sure if self.device or device
+
+    def forward(self, state, action):
+        x = F.relu(self.fc1(torch.cat([state, action], dim=1)))
+        x = F.relu(self.fc2(x))
+        q = self.q(x)
+
+        return q
+
+    def save_checkpoint(self):
+        torch.save(self.state_dict(), self.chkpt_file)
+
+    def load_checkpoint(self):
+        self.load_state_dict(torch.load(self.chkpt_file))
+
+
+class Actor(nn.Module):
+    def __init__(self, lr_actor, input_dims, fc1_dims, fc2_dims,
+                 n_actions, name, actor_param):
+        super(Actor, self).__init__()
+
+        self.chkpt_file = os.path.join(actor_param, name)
+        self.fc1 = nn.Linear(input_dims, fc1_dims)
+        self.fc2 = nn.Linear(fc1_dims, fc2_dims)
+        self.pi = nn.Linear(fc2_dims, n_actions)
+
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=lr_actor)
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.to(self.device)  # TODO: not sure if self.device or device
+
+    def forward(self, state):
+        x = F.relu(self.fc1(state))
+        x = F.relu(self.fc2(x))
+        pi = torch.softmax(self.pi(x), dim=1)
+        return pi
+
+    def save_checkpoint(self):
+        torch.save(self.state_dict(), self.chkpt_file)
+
+    def load_checkpoint(self):
+        self.load_state_dict(torch.load(self.chkpt_file))
+
+
+class Agent:
+    def __init__(self, actor_dims, critic_dims, n_agents, n_actions, agent_i, agent_param,
+                 alpha=0.01, beta=0.01, fc1_dims=64, fc2_dims=64, gamma=0.99, tau=0.01):
+        self.gamma = gamma
+        self.tau = tau
+        self.n_actions = n_actions
+        self.agent_name = f"agent_{agent_i}"
+
+        self.actor = Actor(lr_actor=alpha, input_dims=actor_dims, fc1_dims=fc1_dims, fc2_dims=fc2_dims,
+                           n_actions=n_actions, name=self.agent_name + "_actor", actor_param=agent_param)
+        self.critic = Critic(lr_critic=beta, input_dims=critic_dims, fc1_dims=fc1_dims, fc2_dims=fc2_dims,
+                             n_agents=n_agents, n_actions=n_actions, name=self.agent_name + "_critic",
+                             critic_param=agent_param)
+        self.target_actor = Actor(lr_actor=alpha, input_dims=actor_dims, fc1_dims=fc1_dims, fc2_dims=fc2_dims,
+                                  n_actions=n_actions, name=self.agent_name + "_target_actor",
+                                  actor_param=agent_param)
+        self.target_critic = Critic(lr_critic=beta, input_dims=critic_dims, fc1_dims=fc1_dims, fc2_dims=fc2_dims,
+                                    n_agents=n_agents, n_actions=n_actions,
+                                    name=self.agent_name + "_target_critic", critic_param=agent_param)
+
+        self.update_net(tau=1)
+
+    def update_net(self, tau=None):
+        if tau == None:
+            tau = self.tau
+
+        actor_state_dict = dict(self.actor.named_parameters())
+        target_actor_state_dict = dict(self.target_actor.named_parameters())
+
+        for param in actor_state_dict:
+            actor_state_dict[param] = tau * actor_state_dict[param].clone() + (1 - tau) * target_actor_state_dict[
+                param].clone()
+
+        self.target_actor.load_state_dict(actor_state_dict)
+
+        critic_state_dict = dict(self.critic.named_parameters())
+        target_critic_state_dict = dict(self.target_critic.named_parameters())
+
+        for param in critic_state_dict:
+            critic_state_dict[param] = tau * critic_state_dict[param].clone() + (1 - tau) * target_critic_state_dict[
+                param].clone()
+
+        self.target_critic.load_state_dict(critic_state_dict)
+
+    def get_action(self, observation):
+        state = torch.tensor(data=[observation], dtype=torch.float).to(self.actor.device)
+        actions = self.actor.forward(state)
+        noise = torch.rand(self.n_actions).to(self.actor.device)
+        action = actions + noise
+        return action.detach().cpu().numpy()[0]
+
+    def save_model(self):
+        self.actor.save_checkpoint()
+        self.target_actor.save_checkpoint()
+        self.critic.save_checkpoint()
+        self.target_critic.save_checkpoint()
+
+    def load_model(self):
+        self.actor.load_checkpoint()
+        self.target_actor.load_checkpoint()
+        self.critic.load_checkpoint()
+        self.target_critic.load_checkpoint()
+
+
+class MADDPG:
+    def __init__(self, actor_dims, critic_dims, n_agents, n_actions,
+                 alpha, beta, fc1_dims, fc2_dims, gamma, tau, agent_param_path):
+        self.agents = []
+        self.n_agents = n_agents
+        self.n_actions = n_actions
+
+        for agent_i in range(self.n_agents):
+            self.agents.append(Agent(actor_dims=actor_dims[agent_i], critic_dims=critic_dims, n_agents=self.n_agents,
+                                     n_actions=n_actions, agent_i=agent_i, alpha=alpha, beta=beta,
+                                     agent_param=agent_param_path))  # TODO
+
+    def save_checkpoint(self):
+        print("Saving parameters...")
+        for agent_i in self.agents:
+            agent_i.save_model()
+
+    def load_checkpoint(self):
+        print("Loading parameters...")
+        for agent_i in self.agents:
+            agent_i.load_models()
+
+    def get_actions(self, raw_obs):
+        actions = []
+        for agent_i, agent in enumerate(self.agents):
+            action = agent.get_action(raw_obs[agent_i])
+            actions.append(action)
+
+        return actions
+
+    def learn(self, memory):
+        if not memory.ready():
+            return
+
+        actor_states, states, actions, rewards, \
+            actor_new_states, new_states, dones = memory.sample()
+        device = self.agents[0].actor.device
+
+        states = torch.tensor(states, dtype=torch.float).to(device)
+        actions = torch.tensor(actions, dtype=torch.float).to(device)
+        rewards = torch.tensor(rewards, dtype=torch.float).to(device)
+        new_states = torch.tensor(new_states, dtype=torch.float).to(device)
+        dones = torch.tensor(dones).to(device)
+
+        all_agents_new_actions = []
+        all_agents_new_mu_actions = []
+        old_agents_actions = []
+
+        for agent_i, agent in enumerate(self.agents):
+            tmp = torch.tensor(actor_new_states[agent_i], dtype=torch.float).to(device)
+            new_pi = agent.target_actor.forward(tmp)
+            all_agents_new_actions.append(new_pi)
+
+            mu_states = torch.tensor(actor_states[agent_i], dtype=torch.float).to(device)
+            pi = agent.actor.forward(mu_states)
+            all_agents_new_mu_actions.append(pi)
+
+            old_agents_actions.append(actions[agent_i])
+
+        new_actions = torch.cat([acts for acts in all_agents_new_actions], dim=1)
+        mu = torch.cat([acts for acts in all_agents_new_mu_actions], dim=1)
+        old_actions = torch.cat([acts for acts in old_agents_actions], dim=1)
+
+        for agent_i, agent in enumerate(self.agents):
+            critic_target_value = agent.target_critic.forward(new_states, new_actions).flatten()
+            critic_target_value[dones[:, 0]] = 0.0
+            critic_value = agent.critic.forward(states, old_actions).flatten()
+
+            target = rewards[:, agent_i] + agent.gamma * critic_target_value
+            critic_loss = F.mse_loss(target, critic_value)
+            agent.critic.optimizer.zero_grad()  # .zero_grad() clears old gradients from the last step
+            # critic_loss.backward(retain_graph=True)
+            critic_loss.backward()  # .backward() computes the derivative of the loss
+            agent.critic.optimizer.step()  # .step() is to update the parameters
+
+            actor_loss = agent.critic.forward(states, mu).flatten()
+            actor_loss = -torch.mean(actor_loss)
+            agent.actor.optimizer.zero_grad()
+            # actor_loss.backward(retain_graph=True)
+            actor_loss.backward()
+            agent.actor.optimizer.step()
+            print(f"Agent: {agent_i}, Critic Loss: {critic_loss}, Actor Loss: {actor_loss}")
+
+            agent.update_net()
